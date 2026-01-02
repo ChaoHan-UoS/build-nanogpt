@@ -22,6 +22,9 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        # # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
+        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+        #                                    .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -33,6 +36,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # # attention (materializes the large (T,T) matrix for all queries and keys)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, hs, T) -> (B, nh, T, hs)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
@@ -280,7 +288,11 @@ def get_most_likely_row(tokens, mask, logits):
 # DDP launch for e.g. 8 GPUs:
 # torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
-# run the training loop
+# In DDP, each rank has its own DataLoader and model replica, and processes a
+# different mini-batch with its own forward and backward pass. During backward,
+# DDP averages the gradients across ranks so that every replica ends up with
+# the same gradients. Then each rank performs the same optimizer step locally,
+# keeping all model replicas in sync.
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
@@ -293,6 +305,7 @@ if ddp:
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
     init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
+    # used in multi-node setting. For multi-GPUs on a single node, this is the GPU id same as ddp_rank
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda:{ddp_local_rank}'
@@ -330,13 +343,16 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
+# With ddp, each process gets its own chunk of data, so they all work on different parts of the dataset
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
+# float32 matmuls internally use TensorFloat32 on Tensor Cores
+# (tensors remain float32; effects only on NVIDIA Ampere+ GPUs)
 torch.set_float32_matmul_precision('high')
 
 # create model
-model = GPT(GPTConfig(vocab_size=50304))
+model = GPT(GPTConfig(vocab_size=50304)) # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
@@ -373,6 +389,7 @@ log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
+# run the training loop
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
@@ -433,7 +450,7 @@ for step in range(max_steps):
         if ddp:
             num_total = torch.tensor(num_total, dtype=torch.long, device=device)
             num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM) # the reduced arg must be a tensor
             dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
             num_total = num_total.item()
             num_correct_norm = num_correct_norm.item()
@@ -464,7 +481,7 @@ for step in range(max_steps):
                 # get the probabilities
                 probs = F.softmax(logits, dim=-1)
                 # do top-k sampling of 50 (huggingface pipeline default)
-                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                # topk_probs here becomes (B, 50), topk_indices is (B, 50)
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
                 # select a token from the top-k probabilities
                 # note: multinomial does not demand the input to sum to 1
@@ -482,19 +499,32 @@ for step in range(max_steps):
     # do one step of the optimization
     model.train()
     optimizer.zero_grad()
-    loss_accum = 0.0
+    loss_accum = 0.0 # for printing
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        # added after video, this field is also used by the forward pass.
+        # added after video, thƒis field is also used by the forward pass.
         if ddp:
+            # DDP always averages per-rank gradients once you exit no_sync() (i.e. when
+            # require_backward_grad_sync=True).
+            # - If the per-rank loss is a mean over the local batch, the resulting gradient
+            #   matches the global mean-loss gradient over all samples.
+            # - If the per-rank loss is a sum, the resulting gradient is scaled by
+            #   1 / world_size relative to the global sum-loss gradient. You can compensate
+            #   by scaling the loss or the learning rate by world_size.
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        # torch.float16 usually needs a GradScaler because it has a reduced exponent range.
+        # torch.bfloat16 keeps the FP32 exponent range (only mantissa is shorter), so it
+        # typically doesn't need scaling. bfloat16 is only supported on Ampere+ GPUs.
+        # Unlike TF32 via `torch.set_float32_matmul_precision('high')` (FP32 matmuls only),
+        # autocast runs some CUDA ops (e.g. matmuls) in bfloat16 and others (e.g. softmax) in
+        # float32, hence "automatic mixed precision".
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
-        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+        # instead of a SUM we want MEAN
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
@@ -506,6 +536,7 @@ for step in range(max_steps):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
+
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
     t1 = time.time()
