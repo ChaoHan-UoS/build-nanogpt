@@ -119,7 +119,7 @@ class GPT(nn.Module):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-        # forward the token and posisition embeddings
+        # forward the token and position embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
@@ -367,10 +367,10 @@ min_lr = max_lr * 0.1
 warmup_steps = 715
 max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
+    # 1) linear warmup for warmup_steps steps
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
+    # 2) if it > max_steps, return min learning rate
     if it > max_steps:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
@@ -503,7 +503,7 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        # added after video, thƒis field is also used by the forward pass.
+        # added after video, this field is also used by the forward pass.
         if ddp:
             # DDP always averages per-rank gradients once you exit no_sync() (i.e. when
             # require_backward_grad_sync=True).
